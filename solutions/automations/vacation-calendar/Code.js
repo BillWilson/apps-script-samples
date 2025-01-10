@@ -28,7 +28,6 @@ let GROUP_EMAIL = 'ENTER_GOOGLE_GROUP_EMAIL_HERE';
 
 let ONLY_DIRECT_MEMBERS = false;
 
-let KEYWORDS = ['vacation', 'ooo', 'out of office', 'offline'];
 let MONTHS_IN_ADVANCE = 3;
 
 /**
@@ -66,21 +65,19 @@ function sync() {
     users = getUsersFromGroups(GROUP_EMAIL);
   }
 
-  // For each user, finds events having one or more of the keywords in the event
+  // For each user, finds events wich type is `outOfOffice`
   // summary in the specified date range. Imports each of those to the team
   // calendar.
   let count = 0;
   users.forEach(function(user) {
-    let username = user.getEmail().split('@')[0];
-    KEYWORDS.forEach(function(keyword) {
-      let events = findEvents(user, keyword, today, maxDate, lastRun);
+    let username = user.getUsername();
+    let events = findEvents(user, today, maxDate, lastRun);
       events.forEach(function(event) {
         importEvent(username, event);
         count++;
       }); // End foreach event.
-    }); // End foreach keyword.
   }); // End foreach user.
-
+  
   PropertiesService.getScriptProperties().setProperty('lastRun', today);
   console.log('Imported ' + count + ' events');
 }
@@ -92,6 +89,7 @@ function sync() {
  * @param {Calendar.Event} event The event to import.
  */
 function importEvent(username, event) {
+  let originalSummary = event.summary;
   event.summary = '[' + username + '] ' + event.summary;
   event.organizer = {
     id: TEAM_CALENDAR_ID,
@@ -109,9 +107,58 @@ function importEvent(username, event) {
   console.log('Importing: %s', event.summary);
   try {
     Calendar.Events.import(event, TEAM_CALENDAR_ID);
+    sendSlackNotification(username, event);
   } catch (e) {
     console.error('Error attempting to import event: %s. Skipping.',
         e.toString());
+  }
+}
+
+/**
+ * Sends a notification to Slack about the new calendar event.
+ * @param {string} username The team member's username.
+ * @param {Calendar.Event} event The calendar event details.
+ * @param {string} originalSummary is the original summary of the event.
+ */
+function sendSlackNotification(username, event, originalSummary) {
+  const SLACK_WEBHOOK_URL = 'YOUR_SLACK_WEBHOOK_URL';
+  
+  // Format dates to match the required format (YYYY/MM/DD AM/PM H:MM)
+  function formatDate(dateString) {
+    const date = new Date(dateString);
+    const year = date.getFullYear();
+    const month = String(date.getMonth() + 1).padStart(2, '0');
+    const day = String(date.getDate()).padStart(2, '0');
+    const hours = date.getHours();
+    const minutes = String(date.getMinutes()).padStart(2, '0');
+    const ampm = hours >= 12 ? 'PM' : 'AM';
+    const hour12 = hours % 12 || 12;
+    
+    return `${year}/${month}/${day} ${ampm} ${hour12}:${minutes}`;
+  }
+
+  // Prepare the payload for Slack
+  const payload = {
+    user_name: username,
+    summary: event.summary.replace(`[${username}] `, ''), // Remove the username prefix
+    start: formatDate(event.start.dateTime),
+    end: formatDate(event.end.dateTime)
+  };
+
+  // Send the webhook request
+  try {
+    const options = {
+      method: 'post',
+      contentType: 'application/json',
+      payload: JSON.stringify(payload)
+    };
+    
+    const response = UrlFetchApp.fetch(SLACK_WEBHOOK_URL, options);
+    if (response.getResponseCode() !== 200) {
+      console.error('Failed to send Slack notification. Status code:', response.getResponseCode());
+    }
+  } catch (e) {
+    console.error('Error sending Slack notification:', e.toString());
   }
 }
 
@@ -120,18 +167,17 @@ function importEvent(username, event) {
  * in events within the specified date range and returns any such events
  * found.
  * @param {Session.User} user The user to retrieve events for.
- * @param {string} keyword The keyword to look for.
  * @param {Date} start The starting date of the range to examine.
  * @param {Date} end The ending date of the range to examine.
  * @param {Date} optSince A date indicating the last time this script was run.
  * @return {Calendar.Event[]} An array of calendar events.
  */
-function findEvents(user, keyword, start, end, optSince) {
+function findEvents(user, start, end, optSince) {
   let params = {
-    q: keyword,
     timeMin: formatDateAsRFC3339(start),
     timeMax: formatDateAsRFC3339(end),
     showDeleted: true,
+    eventTypes: "outOfOffice"
   };
   if (optSince) {
     // This prevents the script from examining events that have not been
@@ -147,12 +193,11 @@ function findEvents(user, keyword, start, end, optSince) {
     try {
       response = Calendar.Events.list(user.getEmail(), params);
     } catch (e) {
-      console.error('Error retriving events for %s, %s: %s; skipping',
-          user, keyword, e.toString());
+      console.error('Error retriving events for %s: %s; skipping', user, e.toString());
       continue;
     }
     events = events.concat(response.items.filter(function(item) {
-      return shouldImportEvent(user, keyword, item);
+      return shouldImportEvent(user, item);
     }));
     pageToken = response.nextPageToken;
   } while (pageToken);
@@ -163,17 +208,10 @@ function findEvents(user, keyword, start, end, optSince) {
  * Determines if the given event should be imported into the shared team
  * calendar.
  * @param {Session.User} user The user that is attending the event.
- * @param {string} keyword The keyword being searched for.
  * @param {Calendar.Event} event The event being considered.
  * @return {boolean} True if the event should be imported.
  */
-function shouldImportEvent(user, keyword, event) {
-  // Filters out events where the keyword did not appear in the summary
-  // (that is, the keyword appeared in a different field, and are thus
-  // is not likely to be relevant).
-  if (event.summary.toLowerCase().indexOf(keyword) < 0) {
-    return false;
-  }
+function shouldImportEvent(user, event) {
   if (!event.organizer || event.organizer.email == user.getEmail()) {
     // If the user is the creator of the event, always imports it.
     return true;
